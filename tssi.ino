@@ -1,19 +1,24 @@
-/* * Tactical SSI - Defense Grade Intent Detection
- * Target: Seeed Studio XIAO ESP32-S3
+/* * Tactical SSI - Multi-Intent Detection
+ * Logic: Single Swallow = "SWALLOW", Double Swallow (within 2s) = "DON'T MOVE"
  */
 
 const int bioAmpPin = D0;
 float filteredEnergy = 0;
 const float smoothing = 0.05; 
 
-// --- TUNED FOR YOUR SPECIFIC SCREENSHOT DATA ---
-const int NOISE_DEADZONE = 8000; // Ignore orange jitter (like the 2k-5k ones in your pic)
-const int TRIGGER_LIMIT = 12000;  // Real swallows are 100k+, so 50k is 100% safe
+// --- PARAMETERS ---
+const int NOISE_DEADZONE = 8000;  
+const int TRIGGER_LIMIT = 15000;  
+const unsigned long DOUBLE_TAP_WINDOW = 2000; // 2 seconds window
+
+// --- STATE TRACKING ---
+unsigned long lastTriggerTime = 0;
+int swallowCount = 0;
 
 void setup() {
   Serial.begin(115200);
   analogReadResolution(12);
-  Serial.println("SYSTEM ARMED: WAITING FOR INTENT...");
+  Serial.println(">>> SYSTEM ARMED: MONITORING MULTI-INTENT <<<");
 }
 
 void loop() {
@@ -26,19 +31,12 @@ void loop() {
     delayMicroseconds(300);
   }
 
-  // Calculate current power
   float currentEnergy = (burstSum / 10.0) * 15.0; 
-
-  // Dynamic baseline tracking
   filteredEnergy = (smoothing * currentEnergy) + ((1.0 - smoothing) * filteredEnergy);
-
-  // Calculate the Spike above the moving baseline
   float netSignal = currentEnergy - filteredEnergy;
-  
-  // Apply Deadzone: If it's just that idle jitter you saw, show 0
   float tacticalSignal = (netSignal < NOISE_DEADZONE) ? 0 : netSignal;
 
-  // Output for Serial Plotter
+  // Plotting Data
   Serial.print("Baseline:");
   Serial.print(filteredEnergy);
   Serial.print(",");
@@ -48,11 +46,23 @@ void loop() {
   Serial.print("Limit:");
   Serial.println(TRIGGER_LIMIT);
 
-  // Final Intent Logic
+  // --- DETECTION LOGIC ---
   if (tacticalSignal > TRIGGER_LIMIT) {
-    Serial.println("-------------------------");
-    Serial.println(">>> DETECTED: SWALLOW <<<");
-    Serial.println("-------------------------");
-    delay(1500); // Prevents double-triggers
+    unsigned long currentTime = millis();
+    
+    // Check if this spike happened within 2 seconds of the last one
+    if (currentTime - lastTriggerTime < DOUBLE_TAP_WINDOW) {
+      Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+      Serial.println(">>> ALERT: DON'T MOVE <<<");
+      Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+      lastTriggerTime = 0; // Reset to avoid triple-triggering
+    } else {
+      Serial.println("***************************");
+      Serial.println(">>> CAREFUL: MOVE <<<");
+      Serial.println("***************************");
+      lastTriggerTime = currentTime;
+    }
+    
+    delay(800); // Shorter delay to allow for a quick second swallow
   }
 }
