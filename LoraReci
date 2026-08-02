@@ -1,0 +1,57 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+const int csPin = D3;          
+const int resetPin = D1;       
+const int irqPin = D2;         
+const int statusLED = LED_BUILTIN; 
+
+const int SYNC_WORD = 0x22;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(statusLED, OUTPUT);
+  digitalWrite(statusLED, HIGH);
+
+  // Reset LoRa
+  pinMode(resetPin, OUTPUT);
+  digitalWrite(resetPin, LOW);  delay(100);
+  digitalWrite(resetPin, HIGH); delay(100);
+
+  LoRa.setPins(csPin, resetPin, irqPin);
+
+  if (!LoRa.begin(433E6)) {
+    Serial.println("RX Init Failed!");
+    while (1);
+  }
+
+  // Matching settings
+  LoRa.setSyncWord(SYNC_WORD);
+  LoRa.setSpreadingFactor(12);
+  LoRa.setSignalBandwidth(62.5E3);
+  LoRa.setCodingRate4(8);
+
+  Serial.println(">>> RECEIVER LISTENING FOR MESSAGES <<<");
+}
+
+void loop() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    digitalWrite(statusLED, LOW);
+    
+    String incoming = "";
+    while (LoRa.available()) {
+      incoming += (char)LoRa.read();
+    }
+
+    Serial.println("\n-------------------------------------------");
+    Serial.print(">>> RECEIVED: ");
+    Serial.println(incoming);
+    Serial.print("Signal Strength (RSSI): ");
+    Serial.print(LoRa.packetRssi());
+    Serial.println(" dBm");
+    Serial.println("-------------------------------------------");
+
+    digitalWrite(statusLED, HIGH);
+  }
+}
