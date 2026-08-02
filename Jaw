@@ -1,0 +1,94 @@
+/* * Tactical SSI - Golden Liquid Smooth EMG
+ * Structure: Double Exponential Smoothing (Working Version)
+ * Tuning: Ultra-Low Alpha for Liquid Motion
+ */
+
+const int bioAmpPin = D0;
+
+// --- DUAL-STAGE SMOOTHING TUNED ---
+const float FILTER_ALPHA = 0.06f; // Dropped from 0.08 for even more liquid feel
+float filteredRMS = 0.0f;
+float trend      = 0.0f; 
+
+float adcCenter   = 2048.0f;
+float baselineRMS = 0.0f;
+float triggerLevel = 0.0f;
+
+// --- CALIBRATION ---
+const float TRIG_THRESHOLD_MULT = 1.35f; 
+const float MIN_SIGNAL_JUMP      = 4.5f; 
+
+bool isClenched = false;
+unsigned long lastTrigger = 0;
+
+void calibrate() {
+  Serial.println("\n>>> CALIBRATING: RELAX COMPLETELY <<<");
+  delay(1200);
+
+  long dcSum = 0;
+  for(int i=0; i<300; i++) { dcSum += analogRead(bioAmpPin); delay(1); }
+  adcCenter = (float)dcSum / 300.0f;
+
+  float rmsSum = 0;
+  for(int i=0; i<60; i++) { rmsSum += getInstantRMS(); }
+  baselineRMS = rmsSum / 60.0f;
+  filteredRMS = baselineRMS;
+  trend = 0;
+
+  triggerLevel = baselineRMS + max(baselineRMS * (TRIG_THRESHOLD_MULT - 1.0f), MIN_SIGNAL_JUMP);
+  Serial.printf("Base Noise: %.2f | Trigger: %.2f\n", baselineRMS, triggerLevel);
+}
+
+float getInstantRMS() {
+  float sumSq = 0;
+  const int BURST_SAMPLES = 50; 
+  for (int i = 0; i < BURST_SAMPLES; i++) {
+    float val = (float)analogRead(bioAmpPin) - adcCenter;
+    sumSq += val * val;
+    delayMicroseconds(150);
+  }
+  return sqrtf(sumSq / BURST_SAMPLES);
+}
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+  calibrate();
+}
+
+void loop() {
+  if (Serial.available() && Serial.read() == 'r') calibrate();
+
+  float rawRMS = getInstantRMS();
+
+  // --- STABLE DOUBLE EXPONENTIAL SMOOTHING ---
+  float lastFiltered = filteredRMS;
+  filteredRMS = (FILTER_ALPHA * rawRMS) + ((1.0f - FILTER_ALPHA) * (filteredRMS + trend));
+  trend = (FILTER_ALPHA * (filteredRMS - lastFiltered)) + ((1.0f - FILTER_ALPHA) * trend);
+
+  // Scaling for Plotter (0 = Baseline)
+  float plotSignal = max(0.0f, filteredRMS - baselineRMS);
+  float plotLimit  = max(0.0f, triggerLevel - baselineRMS);
+
+  // Clean the signal (Noise Gate)
+  if (plotSignal < 1.0) plotSignal = 0;
+
+  Serial.print("Liquid_Smooth:"); Serial.print(plotSignal);
+  Serial.print(",Trigger_Line:"); Serial.println(plotLimit);
+
+  // Logic with Hysteresis
+  if (!isClenched && filteredRMS > triggerLevel) {
+    isClenched = true;
+    unsigned long now = millis();
+    if (now - lastTrigger < 1000) {
+      Serial.println(">>> [DOUBLE CLENCH] <<<");
+      lastTrigger = 0;
+    } else {
+      Serial.println(">>> [SINGLE] <<<");
+      lastTrigger = now;
+    }
+  } 
+  else if (isClenched && filteredRMS < (baselineRMS + (triggerLevel - baselineRMS) * 0.35)) {
+    isClenched = false; // Release at 35% height for maximum stability
+  }
+}
