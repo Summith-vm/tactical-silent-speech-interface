@@ -1,0 +1,60 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+const int csPin = D3;          
+const int resetPin = D1;       
+const int irqPin = D2;         
+const int statusLED = LED_BUILTIN; 
+
+const int SYNC_WORD = 0x22;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(statusLED, OUTPUT);
+  digitalWrite(statusLED, HIGH); // OFF
+
+  // Reset LoRa
+  pinMode(resetPin, OUTPUT);
+  digitalWrite(resetPin, LOW);  delay(100);
+  digitalWrite(resetPin, HIGH); delay(100);
+
+  LoRa.setPins(csPin, resetPin, irqPin);
+
+  if (!LoRa.begin(433E6)) {
+    Serial.println("TX Init Failed!");
+    while (1);
+  }
+
+  // RF Matching Settings
+  LoRa.setTxPower(17);
+  LoRa.setSyncWord(SYNC_WORD);
+  LoRa.setSpreadingFactor(12);
+  LoRa.setSignalBandwidth(62.5E3);
+  LoRa.setCodingRate4(8);
+
+  Serial.println("\n=============================================");
+  Serial.println(">>> LORA INTERACTIVE TRANSMITTER READY <<<");
+  Serial.println("Type your message in the box above and press ENTER.");
+  Serial.println("=============================================\n");
+}
+
+void loop() {
+  // Check if you typed something in Serial Monitor
+  if (Serial.available() > 0) {
+    String message = Serial.readStringUntil('\n');
+    message.trim(); // Remove newline characters
+
+    if (message.length() > 0) {
+      digitalWrite(statusLED, LOW); // Flash LED
+
+      Serial.print("Sending Custom Message: ");
+      Serial.println(message);
+
+      LoRa.beginPacket();
+      LoRa.print(message);
+      LoRa.endPacket();
+
+      digitalWrite(statusLED, HIGH);
+    }
+  }
+}
