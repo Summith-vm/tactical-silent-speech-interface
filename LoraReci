@@ -1,57 +1,154 @@
 #include <SPI.h>
 #include <LoRa.h>
+#include "mbedtls/aes.h"
+#include <HardwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
 
-const int csPin = D3;          
-const int resetPin = D1;       
-const int irqPin = D2;         
-const int statusLED = LED_BUILTIN; 
+const int csPin       = D3;
+const int resetPin    = D1;
+const int irqPin      = D2;
+const int statusLED   = LED_BUILTIN;
 
-const int SYNC_WORD = 0x22;
+const long BANDWIDTH_FREQ = 433E6;
+const int SYNC_WORD       = 0x22;
+
+const unsigned char aes_key[16] = {
+  0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+  0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+uint32_t lastReceivedCounter = 0;
+HardwareSerial mySerial1(1);
+DFRobotDFPlayerMini myDFPlayer;
+
+void processEncryptedPacket(const uint8_t* ciphertext, int rssi) {
+  uint8_t decrypted[16] = {0};
+
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  mbedtls_aes_setkey_dec(&aes, aes_key, 128);
+  mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, ciphertext, decrypted);
+  mbedtls_aes_free(&aes);
+
+  uint8_t commandID = decrypted[0];
+  uint32_t incomingCounter = ((uint32_t)decrypted[1] << 24) |
+                             ((uint32_t)decrypted[2] << 16) |
+                             ((uint32_t)decrypted[3] << 8)  |
+                             ((uint32_t)decrypted[4]);
+
+  Serial.print("\n[RAW AIRWAVE CIPHERTEXT]: ");
+  for (int i = 0; i < 16; i++) {
+    Serial.printf("%02X ", ciphertext[i]);
+  }
+  Serial.println();
+
+  if (incomingCounter <= lastReceivedCounter && lastReceivedCounter != 0) {
+    Serial.printf("[SECURITY REJECT] Old/Replayed Packet Detected! (#%u <= #%u) | RSSI: %d dBm\n", 
+                  incomingCounter, lastReceivedCounter, rssi);
+    return;
+  }
+
+  lastReceivedCounter = incomingCounter;
+
+  Serial.println("----------------------------------------");
+  Serial.printf("[RX DECRYPTED #%u] RSSI: %d dBm\n", incomingCounter, rssi);
+
+  if (commandID >= 1 && commandID <= 5) {
+    myDFPlayer.play(commandID);
+  }
+
+  switch (commandID) {
+    case 1:
+      Serial.println("***************************");
+      Serial.println(">>> SOURCE: THROAT <<<");
+      Serial.println(">>> DETECTED: SINGLE SWALLOW (MOVE) <<<");
+      Serial.println("***************************");
+      break;
+
+    case 2:
+      Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+      Serial.println(">>> SOURCE: THROAT <<<");
+      Serial.println(">>> DETECTED: DOUBLE SWALLOW (DON'T MOVE) <<<");
+      Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+      break;
+
+    case 3:
+      Serial.println("---------------------------");
+      Serial.println(">>> SOURCE: JAW <<<");
+      Serial.println(">>> DETECTED: SINGLE JAW CLENCH <<<");
+      Serial.println("---------------------------");
+      break;
+
+    case 4:
+      Serial.println("===========================");
+      Serial.println(">>> SOURCE: JAW <<<");
+      Serial.println(">>> DETECTED: DOUBLE JAW CLENCH <<<");
+      Serial.println("===========================");
+      break;
+
+    case 5:
+      Serial.println("#################################");
+      Serial.println(">>> SOURCE: JAW <<<");
+      Serial.println(">>> DETECTED: TRIPLE JAW CLENCH (HELP) <<<");
+      Serial.println("#################################");
+      break;
+
+    default:
+      Serial.printf("[CORRUPT PACKET REJECTED] Invalid Command ID: %u | RSSI: %d dBm\n", commandID, rssi);
+      break;
+  }
+  
+  Serial.println("----------------------------------------");
+}
 
 void setup() {
   Serial.begin(115200);
+  mySerial1.begin(9600, SERIAL_8N1, D7, D6);
+  
   pinMode(statusLED, OUTPUT);
   digitalWrite(statusLED, HIGH);
 
-  // Reset LoRa
   pinMode(resetPin, OUTPUT);
-  digitalWrite(resetPin, LOW);  delay(100);
-  digitalWrite(resetPin, HIGH); delay(100);
+  digitalWrite(resetPin, LOW);
+  delay(100);
+  digitalWrite(resetPin, HIGH);
+  delay(100);
 
   LoRa.setPins(csPin, resetPin, irqPin);
 
-  if (!LoRa.begin(433E6)) {
-    Serial.println("RX Init Failed!");
-    while (1);
+  if (!LoRa.begin(BANDWIDTH_FREQ)) {
+    Serial.println("FATAL: Receiver LoRa Init Failed! Check SPI Connections.");
+    while (1) {
+      digitalWrite(statusLED, LOW);  delay(50);
+      digitalWrite(statusLED, HIGH); delay(50);
+    }
   }
 
-  // Matching settings
-  LoRa.setSyncWord(SYNC_WORD);
-  LoRa.setSpreadingFactor(12);
-  LoRa.setSignalBandwidth(62.5E3);
-  LoRa.setCodingRate4(8);
+  LoRa.setSyncWord(SYNC_WORD);                  
+  LoRa.setSpreadingFactor(7);            
+  LoRa.setSignalBandwidth(125E3);        
+  LoRa.setCodingRate4(5);                
 
-  Serial.println(">>> RECEIVER LISTENING FOR MESSAGES <<<");
+  myDFPlayer.begin(mySerial1);
+  myDFPlayer.volume(30);
+
+  Serial.println(">>> RECEIVER NODE ARMED: LISTENING FOR 5-INTENT TRANSMISSIONS <<<");
 }
 
 void loop() {
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
-    digitalWrite(statusLED, LOW);
-    
-    String incoming = "";
-    while (LoRa.available()) {
-      incoming += (char)LoRa.read();
+    if (packetSize == 16) {
+      uint8_t ciphertext[16];
+      for (int i = 0; i < 16; i++) {
+        ciphertext[i] = LoRa.read();
+      }
+      
+      digitalWrite(statusLED, LOW);
+      processEncryptedPacket(ciphertext, LoRa.packetRssi());
+      digitalWrite(statusLED, HIGH);
+    } else {
+      while (LoRa.available()) LoRa.read();
     }
-
-    Serial.println("\n-------------------------------------------");
-    Serial.print(">>> RECEIVED: ");
-    Serial.println(incoming);
-    Serial.print("Signal Strength (RSSI): ");
-    Serial.print(LoRa.packetRssi());
-    Serial.println(" dBm");
-    Serial.println("-------------------------------------------");
-
-    digitalWrite(statusLED, HIGH);
   }
 }
