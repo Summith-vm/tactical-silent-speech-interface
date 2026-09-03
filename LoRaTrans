@@ -1,60 +1,249 @@
 #include <SPI.h>
 #include <LoRa.h>
+#include "mbedtls/aes.h"
 
-const int csPin = D3;          
-const int resetPin = D1;       
-const int irqPin = D2;         
-const int statusLED = LED_BUILTIN; 
+// --- HARDWARE PIN CONFIGURATION (XIAO ESP32-S3) ---
+const int bioAmpPin   = D0;          
+const int csPin       = D3;          
+const int resetPin    = D1;          
+const int irqPin      = D2;          
+const int statusLED   = LED_BUILTIN; 
 
-const int SYNC_WORD = 0x22;
+// --- RF & HARDWARE ENCRYPTION CONFIGURATION ---
+const long BANDWIDTH_FREQ = 433E6;   
+const int SYNC_WORD       = 0x22;    
+
+const unsigned char aes_key[16] = {
+  0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+  0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+uint32_t packetCounter = 0;
+
+// --- PROVEN EXACT ENERGY & DETECTION PARAMETERS ---
+float filteredEnergy = 0.0f;
+const float smoothing = 0.04f; 
+
+const int NOISE_DEADZONE    = 8000;  
+const int TRIGGER_LIMIT     = 1000; // Swallow limit
+const int JAW_TRIGGER_LIMIT = 24000; // Jaw Clench limit
+
+// --- TIMING WINDOWS ---
+const unsigned long DOUBLE_TAP_WINDOW  = 1600; // 1.6s double-action window
+const unsigned long LONG_HOLD_MIN_MS   = 1800; // 1.8s continuous clench for Help
+
+// --- STATE TRACKING ---
+bool isActuated = false;
+bool isJawPeak = false;
+bool longActionFired = false;
+unsigned long actuationStartTime = 0;
+
+int swallowTapCount = 0;
+unsigned long lastSwallowTime = 0;
+bool waitingSwallow = false;
+
+int jawTapCount = 0;
+unsigned long lastJawTime = 0;
+bool waitingJaw = false;
+
+// --- FAST LOW-LATENCY TRANSMISSION ---
+void sendEncryptedIntent(uint8_t commandID) {
+  uint8_t plaintext[16] = {0};
+  uint8_t ciphertext[16] = {0};
+
+  plaintext[0] = commandID; 
+  
+  packetCounter++;
+  plaintext[1] = (packetCounter >> 24) & 0xFF;
+  plaintext[2] = (packetCounter >> 16) & 0xFF;
+  plaintext[3] = (packetCounter >> 8)  & 0xFF;
+  plaintext[4] = packetCounter & 0xFF;
+
+  for (int i = 5; i < 16; i++) {
+    plaintext[i] = esp_random() & 0xFF; 
+  }
+
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  mbedtls_aes_setkey_enc(&aes, aes_key, 128);
+  mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, plaintext, ciphertext);
+  mbedtls_aes_free(&aes);
+
+  digitalWrite(statusLED, LOW); 
+
+  LoRa.beginPacket();
+  LoRa.write(ciphertext, 16);
+  LoRa.endPacket();
+
+  digitalWrite(statusLED, HIGH);
+
+  Serial.printf("[TX #%u] PACKET SENT (Cmd %u): ", packetCounter, commandID);
+  for (int i = 0; i < 16; i++) {
+    Serial.printf("%02X ", ciphertext[i]);
+  }
+  Serial.println();
+}
 
 void setup() {
   Serial.begin(115200);
+  
   pinMode(statusLED, OUTPUT);
-  digitalWrite(statusLED, HIGH); // OFF
+  digitalWrite(statusLED, HIGH);
+  
+  analogReadResolution(12);
 
-  // Reset LoRa
   pinMode(resetPin, OUTPUT);
-  digitalWrite(resetPin, LOW);  delay(100);
-  digitalWrite(resetPin, HIGH); delay(100);
+  digitalWrite(resetPin, LOW);
+  delay(100);
+  digitalWrite(resetPin, HIGH);
+  delay(100);
 
   LoRa.setPins(csPin, resetPin, irqPin);
 
-  if (!LoRa.begin(433E6)) {
-    Serial.println("TX Init Failed!");
+  if (!LoRa.begin(BANDWIDTH_FREQ)) {
+    Serial.println("FATAL: LoRa Init Failed! Check SPI Connections.");
     while (1);
   }
 
-  // RF Matching Settings
-  LoRa.setTxPower(17);
-  LoRa.setSyncWord(SYNC_WORD);
-  LoRa.setSpreadingFactor(12);
-  LoRa.setSignalBandwidth(62.5E3);
-  LoRa.setCodingRate4(8);
+  LoRa.setTxPower(20, PA_OUTPUT_PA_BOOST_PIN); 
+  LoRa.setSyncWord(SYNC_WORD);                  
+  LoRa.setSpreadingFactor(7);           
+  LoRa.setSignalBandwidth(125E3);        
+  LoRa.setCodingRate4(5);               
 
-  Serial.println("\n=============================================");
-  Serial.println(">>> LORA INTERACTIVE TRANSMITTER READY <<<");
-  Serial.println("Type your message in the box above and press ENTER.");
-  Serial.println("=============================================\n");
+  // Seed baseline to true resting level on startup
+  long initSum = 0;
+  for (int i = 0; i < 60; i++) {
+    int val = analogRead(bioAmpPin);
+    initSum += abs(val - 2048);
+    delay(2);
+  }
+  filteredEnergy = (initSum / 60.0f / 10.0f) * 15.0f;
+
+  Serial.println(">>> TRANSMITTER READY: MULTI-INTENT ENGINE ACTIVE <<<");
 }
 
 void loop() {
-  // Check if you typed something in Serial Monitor
-  if (Serial.available() > 0) {
-    String message = Serial.readStringUntil('\n');
-    message.trim(); // Remove newline characters
+  long burstSum = 0;
+  int rawCenter = 2048; 
 
-    if (message.length() > 0) {
-      digitalWrite(statusLED, LOW); // Flash LED
+  // Burst sampling
+  for (int i = 0; i < 60; i++) {
+    int val = analogRead(bioAmpPin);
+    burstSum += abs(val - rawCenter); 
+    delayMicroseconds(300);
+  }
 
-      Serial.print("Sending Custom Message: ");
-      Serial.println(message);
+  // Energy Calculation with Continuous Adaptation
+  float currentEnergy = (burstSum / 10.0f) * 15.0f; 
+  filteredEnergy = (smoothing * currentEnergy) + ((1.0f - smoothing) * filteredEnergy);
+  float netSignal = currentEnergy - filteredEnergy;
+  float tacticalSignal = (netSignal < NOISE_DEADZONE) ? 0.0f : netSignal;
 
-      LoRa.beginPacket();
-      LoRa.print(message);
-      LoRa.endPacket();
+  // Real-time Serial Plotter stream
+  Serial.print("Baseline:");
+  Serial.print(filteredEnergy);
+  Serial.print(",");
+  Serial.print("Tactical_Signal:");
+  Serial.print(tacticalSignal);
+  Serial.print(",");
+  Serial.print("Trigger_Limit:");
+  Serial.println(TRIGGER_LIMIT);
 
-      digitalWrite(statusLED, HIGH);
+  unsigned long now = millis();
+
+  // --- 1. RISING EDGE (MOVEMENT STARTED) ---
+  if (!isActuated && tacticalSignal > TRIGGER_LIMIT) {
+    isActuated = true;
+    actuationStartTime = now;
+    longActionFired = false;
+    isJawPeak = false;
+  }
+
+  // --- 2. ACTIVE HOLD STATE & SUSTAINED LONG CLENCH ---
+  if (isActuated) {
+    if (tacticalSignal >= JAW_TRIGGER_LIMIT) {
+      isJawPeak = true;
+    }
+
+    // Check if raw energy remains high continuously during hold
+    if (isJawPeak && !longActionFired && (currentEnergy > filteredEnergy + (JAW_TRIGGER_LIMIT / 2))) {
+      unsigned long holdDuration = now - actuationStartTime;
+      if (holdDuration >= LONG_HOLD_MIN_MS) {
+        Serial.println("\n#################################");
+        Serial.println(">>> DETECTED: LONG CLENCH (HELP) <<<");
+        Serial.println("#################################\n");
+        
+        sendEncryptedIntent(5); // Cmd 5: LONG CLENCH
+        longActionFired = true;
+
+        // Cancel short tap trackers
+        jawTapCount = 0;
+        waitingJaw = false;
+        swallowTapCount = 0;
+        waitingSwallow = false;
+      }
     }
   }
+
+  // --- 3. FALLING EDGE (MUSCLE RELEASED BACK TO ZERO) ---
+  if (isActuated && tacticalSignal == 0.0f) {
+    isActuated = false;
+    unsigned long pulseDuration = now - actuationStartTime;
+
+    if (!longActionFired && pulseDuration < LONG_HOLD_MIN_MS) {
+      if (isJawPeak) {
+        jawTapCount++;
+        lastJawTime = now;
+        waitingJaw = true;
+
+        if (jawTapCount >= 2) {
+          Serial.println("\n===========================");
+          Serial.println(">>> DETECTED: DOUBLE JAW CLENCH <<<");
+          Serial.println("===========================\n");
+          sendEncryptedIntent(4); // Cmd 4
+          jawTapCount = 0;
+          waitingJaw = false;
+        }
+      } else {
+        swallowTapCount++;
+        lastSwallowTime = now;
+        waitingSwallow = true;
+
+        if (swallowTapCount >= 2) {
+          Serial.println("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+          Serial.println(">>> DETECTED: DOUBLE SWALLOW <<<");
+          Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+          sendEncryptedIntent(2); // Cmd 2
+          swallowTapCount = 0;
+          waitingSwallow = false;
+        }
+      }
+    }
+  }
+
+  // --- 4. TIMEOUT DECISION FOR SINGLE ACTIONS ---
+  if (waitingSwallow && (now - lastSwallowTime > DOUBLE_TAP_WINDOW)) {
+    if (swallowTapCount == 1) {
+      Serial.println("\n***************************");
+      Serial.println(">>> DETECTED: SINGLE SWALLOW <<<");
+      Serial.println("***************************\n");
+      sendEncryptedIntent(1); // Cmd 1
+    }
+    swallowTapCount = 0;
+    waitingSwallow = false;
+  }
+
+  if (waitingJaw && (now - lastJawTime > DOUBLE_TAP_WINDOW)) {
+    if (jawTapCount == 1) {
+      Serial.println("\n---------------------------");
+      Serial.println(">>> DETECTED: SINGLE JAW CLENCH <<<");
+      Serial.println("---------------------------\n");
+      sendEncryptedIntent(3); // Cmd 3
+    }
+    jawTapCount = 0;
+    waitingJaw = false;
+  }
+
+  delay(16);
 }
