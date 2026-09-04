@@ -1,0 +1,304 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include "mbedtls/aes.h"
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+// --- HARDWARE PIN CONFIGURATION (XIAO ESP32-S3) ---
+const int bioAmpPin   = D0;          
+const int csPin       = D3;          
+const int resetPin    = D1;          
+const int irqPin      = D2;          
+const int statusLED   = LED_BUILTIN; 
+
+// --- GPS CONFIGURATION (GY-NEO6MV2) ---
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1); // UART1: D7 = RX, D6 = TX
+
+// --- RF & HARDWARE ENCRYPTION CONFIGURATION ---
+const long BANDWIDTH_FREQ = 433E6;   
+const int SYNC_WORD       = 0x22;    
+
+const unsigned char aes_key[16] = {
+  0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+  0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+uint32_t packetCounter = 0;
+
+// --- HARDENED NOISE & DETECTION PARAMETERS ---
+float filteredEnergy = 0.0f;
+const float smoothing = 0.04f; 
+
+const int NOISE_DEADZONE        = 22000; 
+const int TRIGGER_LIMIT         = 14000; 
+const int JAW_TRIGGER_LIMIT     = 36000; 
+const unsigned long MIN_GESTURE_DURATION = 80; 
+
+// --- TIMING WINDOWS ---
+const unsigned long DOUBLE_TAP_WINDOW  = 1600; 
+const unsigned long LONG_HOLD_MIN_MS   = 1800; 
+
+// --- STATE TRACKING ---
+bool isActuated = false;
+bool isJawPeak = false;
+bool longActionFired = false;
+unsigned long actuationStartTime = 0;
+
+int swallowTapCount = 0;
+unsigned long lastSwallowTime = 0;
+bool waitingSwallow = false;
+
+int jawTapCount = 0;
+unsigned long lastJawTime = 0;
+bool waitingJaw = false;
+
+// --- NON-BLOCKING GPS BACKGROUND PARSER ---
+void feedGPS() {
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+}
+
+// --- FAST LOW-LATENCY TRANSMISSION WITH EMBEDDED GPS & AES ---
+void sendEncryptedIntent(uint8_t commandID) {
+  uint8_t plaintext[16] = {0};
+  uint8_t ciphertext[16] = {0};
+
+  // 1. Pack Command Byte (1 to 5)
+  plaintext[0] = commandID; 
+  
+  // 2. Pack 32-bit Anti-Replay Packet Counter
+  packetCounter++;
+  plaintext[1] = (packetCounter >> 24) & 0xFF;
+  plaintext[2] = (packetCounter >> 16) & 0xFF;
+  plaintext[3] = (packetCounter >> 8)  & 0xFF;
+  plaintext[4] = packetCounter & 0xFF;
+
+  // 3. Extract & Validate Real-Time GPS Coordinates
+  int32_t latFixed = 0;
+  int32_t lngFixed = 0;
+  uint8_t sats = (uint8_t)gps.satellites.value();
+
+  // FIX: Base coordinate packaging on valid location and reasonable age (<10s)
+  if (gps.location.isValid() && (gps.location.age() < 10000)) {
+    latFixed = (int32_t)(gps.location.lat() * 1000000.0);
+    lngFixed = (int32_t)(gps.location.lng() * 1000000.0);
+  } else {
+    latFixed = 0;
+    lngFixed = 0;
+  }
+
+  plaintext[5] = (latFixed >> 24) & 0xFF;
+  plaintext[6] = (latFixed >> 16) & 0xFF;
+  plaintext[7] = (latFixed >> 8)  & 0xFF;
+  plaintext[8] = latFixed & 0xFF;
+
+  plaintext[9]  = (lngFixed >> 24) & 0xFF;
+  plaintext[10] = (lngFixed >> 16) & 0xFF;
+  plaintext[11] = (lngFixed >> 8)  & 0xFF;
+  plaintext[12] = lngFixed & 0xFF;
+
+  plaintext[13] = sats;
+
+  // 4. Fill remaining 2 bytes with hardware random noise padding
+  plaintext[14] = esp_random() & 0xFF;
+  plaintext[15] = esp_random() & 0xFF;
+
+  // 5. Hardware AES-128 Block Cipher Encryption
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  mbedtls_aes_setkey_enc(&aes, aes_key, 128);
+  mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, plaintext, ciphertext);
+  mbedtls_aes_free(&aes);
+
+  // 6. Transmit 16-Byte Ciphertext Block via LoRa
+  digitalWrite(statusLED, LOW); 
+
+  LoRa.beginPacket();
+  LoRa.write(ciphertext, 16);
+  LoRa.endPacket();
+
+  digitalWrite(statusLED, HIGH);
+
+  Serial.printf("\n[TX #%u] PACKET SENT (Cmd %u | Sats: %u | Lat: %d, Lng: %d): ", 
+                packetCounter, commandID, sats, latFixed, lngFixed);
+  for (int i = 0; i < 16; i++) {
+    Serial.printf("%02X ", ciphertext[i]);
+  }
+  Serial.println();
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(statusLED, OUTPUT);
+  digitalWrite(statusLED, HIGH);
+  
+  analogReadResolution(12);
+
+  // Initialize GPS UART (D7 = RX, D6 = TX)
+  gpsSerial.begin(9600, SERIAL_8N1, D7, D6);
+
+  // Hardware Reset LoRa
+  pinMode(resetPin, OUTPUT);
+  digitalWrite(resetPin, LOW);
+  delay(100);
+  digitalWrite(resetPin, HIGH);
+  delay(100);
+
+  LoRa.setPins(csPin, resetPin, irqPin);
+
+  if (!LoRa.begin(BANDWIDTH_FREQ)) {
+    Serial.println("FATAL: LoRa Init Failed! Check SPI Connections.");
+    while (1);
+  }
+
+  // SF10 matching Receiver
+  LoRa.setTxPower(20, PA_OUTPUT_PA_BOOST_PIN); 
+  LoRa.setSyncWord(SYNC_WORD);                  
+  LoRa.setSpreadingFactor(10);           
+  LoRa.setSignalBandwidth(125E3);        
+  LoRa.setCodingRate4(5);               
+
+  // Baseline calibration
+  long initSum = 0;
+  for (int i = 0; i < 80; i++) {
+    int val = analogRead(bioAmpPin);
+    initSum += abs(val - 2048);
+    delay(2);
+    feedGPS();
+  }
+  filteredEnergy = (initSum / 80.0f / 10.0f) * 15.0f;
+
+  Serial.println(">>> TRANSMITTER READY: MULTI-INTENT + STABILIZED GPS ARMED <<<");
+}
+
+void loop() {
+  feedGPS();
+
+  long burstSum = 0;
+  int rawCenter = 2048; 
+
+  // Burst sampling with periodic GPS feeding to avoid FIFO overflow
+  for (int i = 0; i < 60; i++) {
+    int val = analogRead(bioAmpPin);
+    burstSum += abs(val - rawCenter); 
+    delayMicroseconds(300);
+    if (i == 30) feedGPS();
+  }
+
+  // Energy calculation with continuous adaptation
+  float currentEnergy = (burstSum / 10.0f) * 15.0f; 
+  filteredEnergy = (smoothing * currentEnergy) + ((1.0f - smoothing) * filteredEnergy);
+  float netSignal = currentEnergy - filteredEnergy;
+  float tacticalSignal = (netSignal < NOISE_DEADZONE) ? 0.0f : (netSignal - NOISE_DEADZONE);
+
+  // Real-time stream for validation
+  Serial.print("Baseline:");
+  Serial.print(filteredEnergy);
+  Serial.print(",");
+  Serial.print("Tactical_Signal:");
+  Serial.print(tacticalSignal);
+  Serial.print(",");
+  Serial.print("Trigger_Limit:");
+  Serial.println(TRIGGER_LIMIT);
+
+  unsigned long now = millis();
+
+  // --- 1. RISING EDGE (MOVEMENT STARTED) ---
+  if (!isActuated && tacticalSignal > TRIGGER_LIMIT) {
+    isActuated = true;
+    actuationStartTime = now;
+    longActionFired = false;
+    isJawPeak = false;
+  }
+
+  // --- 2. ACTIVE HOLD STATE & SUSTAINED LONG CLENCH ---
+  if (isActuated) {
+    if (tacticalSignal >= JAW_TRIGGER_LIMIT) {
+      isJawPeak = true;
+    }
+
+    if (isJawPeak && !longActionFired && (tacticalSignal >= JAW_TRIGGER_LIMIT * 0.5f)) {
+      unsigned long holdDuration = now - actuationStartTime;
+      if (holdDuration >= LONG_HOLD_MIN_MS) {
+        Serial.println("\n#################################");
+        Serial.println(">>> DETECTED: LONG CLENCH (HELP) <<<");
+        Serial.println("#################################\n");
+        
+        sendEncryptedIntent(5); // Cmd 5: LONG CLENCH (HELP + GPS)
+        longActionFired = true;
+
+        jawTapCount = 0;
+        waitingJaw = false;
+        swallowTapCount = 0;
+        waitingSwallow = false;
+      }
+    }
+  }
+
+  // --- 3. FALLING EDGE (HYSTERESIS RELEASE: DROPS BELOW 35% OF TRIGGER) ---
+  float releaseThreshold = TRIGGER_LIMIT * 0.35f;
+  if (isActuated && tacticalSignal < releaseThreshold) {
+    isActuated = false;
+    unsigned long pulseDuration = now - actuationStartTime;
+
+    // Reject electrical glitches shorter than 80ms
+    if (!longActionFired && pulseDuration >= MIN_GESTURE_DURATION && pulseDuration < LONG_HOLD_MIN_MS) {
+      if (isJawPeak) {
+        jawTapCount++;
+        lastJawTime = now;
+        waitingJaw = true;
+
+        if (jawTapCount >= 2) {
+          Serial.println("\n===========================");
+          Serial.println(">>> DETECTED: DOUBLE JAW CLENCH <<<");
+          Serial.println("===========================\n");
+          sendEncryptedIntent(4); // Cmd 4
+          jawTapCount = 0;
+          waitingJaw = false;
+        }
+      } else {
+        swallowTapCount++;
+        lastSwallowTime = now;
+        waitingSwallow = true;
+
+        if (swallowTapCount >= 2) {
+          Serial.println("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+          Serial.println(">>> DETECTED: DOUBLE SWALLOW <<<");
+          Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+          sendEncryptedIntent(2); // Cmd 2
+          swallowTapCount = 0;
+          waitingSwallow = false;
+        }
+      }
+    }
+  }
+
+  // --- 4. TIMEOUT DECISION FOR SINGLE ACTIONS ---
+  if (waitingSwallow && (now - lastSwallowTime > DOUBLE_TAP_WINDOW)) {
+    if (swallowTapCount == 1 && !isActuated) {
+      Serial.println("\n***************************");
+      Serial.println(">>> DETECTED: SINGLE SWALLOW <<<");
+      Serial.println("***************************\n");
+      sendEncryptedIntent(1); // Cmd 1
+    }
+    swallowTapCount = 0;
+    waitingSwallow = false;
+  }
+
+  if (waitingJaw && (now - lastJawTime > DOUBLE_TAP_WINDOW)) {
+    if (jawTapCount == 1 && !isActuated) {
+      Serial.println("\n---------------------------");
+      Serial.println(">>> DETECTED: SINGLE JAW CLENCH <<<");
+      Serial.println("---------------------------\n");
+      sendEncryptedIntent(3); // Cmd 3
+    }
+    jawTapCount = 0;
+    waitingJaw = false;
+  }
+
+  feedGPS();
+  delay(10);
+}
