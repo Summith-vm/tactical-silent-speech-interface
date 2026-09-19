@@ -3,6 +3,8 @@
 #include "mbedtls/aes.h"
 #include <HardwareSerial.h>
 #include <DFRobotDFPlayerMini.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
 // --- HARDWARE PIN CONFIGURATION (XIAO ESP32-S3) ---
 const int csPin       = D3;
@@ -10,14 +12,19 @@ const int resetPin    = D1;
 const int irqPin      = D2;
 const int statusLED   = LED_BUILTIN;
 
-// --- RF CONFIGURATION (Updated to SF10 for -132 dBm sensitivity) ---
+// --- LCD CONFIGURATION (Change 0x27 to 0x3F if needed) ---
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+
+// --- RF CONFIGURATION ---
 const long BANDWIDTH_FREQ = 433E6;
 const int SYNC_WORD       = 0x22;
 
-// --- SECURITY & DECRYPTION CONFIG ---
-const unsigned char aes_key[16] = {
+// Matching 32-byte (256-bit) Key for AES-256
+const unsigned char aes_key[32] = {
   0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
-  0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+  0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C,
+  0x4A, 0x92, 0x6C, 0x1B, 0x8A, 0x33, 0xD4, 0x5F,
+  0xE3, 0x71, 0x90, 0x22, 0xBB, 0x14, 0x8C, 0x55
 };
 
 uint32_t lastReceivedCounter = 0;
@@ -25,50 +32,36 @@ HardwareSerial mySerial1(1);
 DFRobotDFPlayerMini myDFPlayer;
 
 void processEncryptedPacket(const uint8_t* ciphertext, int rssi) {
+  // 1. Hardware AES-256 Decryption
   uint8_t decrypted[16] = {0};
-
-  // 1. Airwave Ciphertext Monitor
-  Serial.print("\n[RAW AIRWAVE CIPHERTEXT]: ");
-  for (int i = 0; i < 16; i++) {
-    Serial.printf("%02X ", ciphertext[i]);
-  }
-  Serial.println();
-
-  // 2. Hardware AES-128 Decryption
   mbedtls_aes_context aes;
   mbedtls_aes_init(&aes);
-  mbedtls_aes_setkey_dec(&aes, aes_key, 128);
+  mbedtls_aes_setkey_dec(&aes, aes_key, 256); 
   mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, ciphertext, decrypted);
   mbedtls_aes_free(&aes);
 
-  // 3. Unpack Command Byte & Sequence Counter
   uint8_t commandID = decrypted[0];
   uint32_t incomingCounter = ((uint32_t)decrypted[1] << 24) |
                              ((uint32_t)decrypted[2] << 16) |
                              ((uint32_t)decrypted[3] << 8)  |
                              ((uint32_t)decrypted[4]);
 
-  // INTEGRITY GUARD 1: Drop corrupted packets with invalid command IDs
   if (commandID < 1 || commandID > 5) {
-    Serial.printf("[CORRUPT PACKET REJECTED] Invalid Command ID: %u | RSSI: %d dBm\n", commandID, rssi);
+    Serial.printf("[CORRUPT PACKET REJECTED] Invalid Command ID: %u\n", commandID);
     return;
   }
 
-  // INTEGRITY GUARD 2: Transmitter reboot auto-synchronization
   if (lastReceivedCounter > 1000000 || (incomingCounter == 1 && lastReceivedCounter > 5) || (incomingCounter < lastReceivedCounter && (lastReceivedCounter - incomingCounter > 3))) {
     lastReceivedCounter = 0;
   }
 
-  // INTEGRITY GUARD 3: Anti-replay protection
   if (incomingCounter <= lastReceivedCounter && lastReceivedCounter != 0) {
-    Serial.printf("[SECURITY REJECT] Old/Replayed Packet Detected! (#%u <= #%u) | RSSI: %d dBm\n", 
-                  incomingCounter, lastReceivedCounter, rssi);
+    Serial.printf("[SECURITY REJECT] Old/Replayed Packet Detected! (#%u <= #%u)\n", incomingCounter, lastReceivedCounter);
     return;
   }
 
   lastReceivedCounter = incomingCounter;
 
-  // 4. Unpack Verified GPS Coordinates (Bytes 5 to 13)
   int32_t latFixed = ((int32_t)decrypted[5] << 24) |
                      ((int32_t)decrypted[6] << 16) |
                      ((int32_t)decrypted[7] << 8)  |
@@ -80,80 +73,135 @@ void processEncryptedPacket(const uint8_t* ciphertext, int rssi) {
                      ((int32_t)decrypted[12]);
 
   uint8_t sats = decrypted[13];
-
   float latitude  = latFixed / 1000000.0f;
   float longitude = lngFixed / 1000000.0f;
 
-  // 5. Trigger Audio Playback
+  // 2. Play Audio File Immediately
   myDFPlayer.play(commandID);
 
-  // 6. Print Decrypted Intent & Location Telemetry
+  // 3. Serial Monitor Output Matching Screenshot Format
   Serial.println("----------------------------------------");
   Serial.printf("[RX DECRYPTED #%u] RSSI: %d dBm\n", incomingCounter, rssi);
+  Serial.println("----------------------------------------");
 
   switch (commandID) {
     case 1:
-      Serial.println("***************************");
       Serial.println(">>> SOURCE: THROAT <<<");
       Serial.println(">>> DETECTED: SINGLE SWALLOW (MOVE) <<<");
-      Serial.println("***************************");
       break;
-
     case 2:
-      Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!");
       Serial.println(">>> SOURCE: THROAT <<<");
       Serial.println(">>> DETECTED: DOUBLE SWALLOW (DON'T MOVE) <<<");
-      Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!");
       break;
-
     case 3:
-      Serial.println("---------------------------");
       Serial.println(">>> SOURCE: JAW <<<");
       Serial.println(">>> DETECTED: SINGLE JAW CLENCH <<<");
-      Serial.println("---------------------------");
       break;
-
     case 4:
-      Serial.println("===========================");
       Serial.println(">>> SOURCE: JAW <<<");
       Serial.println(">>> DETECTED: DOUBLE JAW CLENCH <<<");
-      Serial.println("===========================");
       break;
-
     case 5:
-      Serial.println("#################################");
       Serial.println(">>> SOURCE: JAW <<<");
       Serial.println(">>> DETECTED: LONG CLENCH (HELP) <<<");
-      Serial.println("#################################");
       break;
   }
 
-  // Display Operator Positioning
+  Serial.println("----------------------------------------");
   Serial.println("--- OPERATOR POSITION (GPS) ---");
   Serial.printf("Satellites Locked: %u\n", sats);
   if (latFixed == 0 && lngFixed == 0) {
-    Serial.println("Position: SEARCHING FOR SATELLITES (No Accurate Fix Yet)");
+    Serial.println("Position: SEARCHING FOR SATELLITES");
   } else {
     Serial.printf("Latitude : %.6f\n", latitude);
     Serial.printf("Longitude: %.6f\n", longitude);
     Serial.printf("Maps URL : https://maps.google.com/?q=%.6f,%.6f\n", latitude, longitude);
   }
   Serial.println("----------------------------------------");
+  
+  Serial.print("[RAW AIRWAVE CIPHERTEXT]: ");
+  for (int i = 0; i < 16; i++) {
+    Serial.printf("%02X ", ciphertext[i]);
+  }
+  Serial.println("\n----------------------------------------");
+
+  // 4. ENCRYPT AND SEND ACKNOWLEDGMENT IMMEDIATELY
+  delay(50); 
+
+  uint8_t ackPlaintext[16] = {0};
+  uint8_t ackCiphertext[16] = {0};
+
+  ackPlaintext[0] = 0xAA; 
+  ackPlaintext[1] = (incomingCounter >> 24) & 0xFF;
+  ackPlaintext[2] = (incomingCounter >> 16) & 0xFF;
+  ackPlaintext[3] = (incomingCounter >> 8)  & 0xFF;
+  ackPlaintext[4] = incomingCounter & 0xFF;
+  ackPlaintext[5] = commandID; 
+
+  for (int i = 6; i < 16; i++) {
+    ackPlaintext[i] = esp_random() & 0xFF;
+  }
+
+  mbedtls_aes_context aes_enc;
+  mbedtls_aes_context *aes_enc_ptr = &aes_enc;
+  mbedtls_aes_init(aes_enc_ptr);
+  mbedtls_aes_setkey_enc(aes_enc_ptr, aes_key, 256);
+  mbedtls_aes_crypt_ecb(aes_enc_ptr, MBEDTLS_AES_ENCRYPT, ackPlaintext, ackCiphertext);
+  mbedtls_aes_free(aes_enc_ptr);
+
+  LoRa.beginPacket();
+  LoRa.write(ackCiphertext, 16);
+  LoRa.endPacket();
+  
+  Serial.printf("[TX ACK] Command %u successfully echoed back to Transmitter.\n", commandID);
+
+  // 5. UPDATE LCD: SHOW ONLY LATITUDE AND LONGITUDE (No text header)
+  lcd.clear();
+  
+  if (latFixed == 0 && lngFixed == 0) {
+    lcd.setCursor(0, 0);
+    lcd.print("Lat: Searching");
+    lcd.setCursor(0, 1);
+    lcd.print("Lng: No Fix Yet");
+  } else {
+    // Format Latitude on Row 0
+    lcd.setCursor(0, 0);
+    lcd.print("Lat:");
+    lcd.print(latitude, 5); // Prints up to 5 decimal places to fit 16 chars
+
+    // Format Longitude on Row 1
+    lcd.setCursor(0, 1);
+    lcd.print("Lng:");
+    lcd.print(longitude, 5);
+  }
+
+  // HOLD FOR EXACTLY 2 SECONDS
+  delay(2000); 
+
+  // Reset LCD back to waiting state
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("RECEIVER READY");
+  lcd.setCursor(0, 1);
+  lcd.print("Waiting for Cmd.");
 }
 
 void setup() {
   Serial.begin(115200);
-  
-  // DFPlayer UART Init (RX = D7, TX = D6)
   mySerial1.begin(9600, SERIAL_8N1, D7, D6);
+  
+  Wire.begin(D4, D5); 
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("BOOTING SYSTEM..");
+
   delay(500);
 
   pinMode(statusLED, OUTPUT);
   digitalWrite(statusLED, HIGH);
-
   lastReceivedCounter = 0;
 
-  // Hardware Reset LoRa Module
   pinMode(resetPin, OUTPUT);
   digitalWrite(resetPin, LOW);
   delay(100);
@@ -163,42 +211,43 @@ void setup() {
   LoRa.setPins(csPin, resetPin, irqPin);
 
   if (!LoRa.begin(BANDWIDTH_FREQ)) {
-    Serial.println("FATAL: Receiver LoRa Init Failed! Check SPI Connections.");
-    while (1) {
-      digitalWrite(statusLED, LOW);  delay(50);
-      digitalWrite(statusLED, HIGH); delay(50);
-    }
+    Serial.println("FATAL: Receiver LoRa Init Failed!");
+    lcd.clear();
+    lcd.print("LORA SPI FAILED!");
+    while (1) { digitalWrite(statusLED, LOW); delay(50); digitalWrite(statusLED, HIGH); delay(50); }
   }
 
-  // Updated Spreading Factor 10 (SF10) to match Transmitter
   LoRa.setSyncWord(SYNC_WORD);                  
   LoRa.setSpreadingFactor(10);            
   LoRa.setSignalBandwidth(125E3);        
   LoRa.setCodingRate4(5);                
 
   if (!myDFPlayer.begin(mySerial1)) {
-    Serial.println("[DFPLAYER WARNING] Module not responding or SD card missing.");
+    Serial.println("[DFPLAYER WARNING] Module not responding.");
   } else {
     myDFPlayer.volume(30);
   }
 
-  Serial.println(">>> RECEIVER NODE ARMED: LISTENING FOR 5-INTENT + GPS TRANSMISSIONS <<<");
+  Serial.println(">>> RECEIVER NODE ARMED <<<");
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("RECEIVER READY");
+  lcd.setCursor(0, 1);
+  lcd.print("Waiting for Cmd.");
 }
 
 void loop() {
   int packetSize = LoRa.parsePacket();
-  if (packetSize) {
-    if (packetSize == 16) {
-      uint8_t ciphertext[16];
-      for (int i = 0; i < 16; i++) {
-        ciphertext[i] = LoRa.read();
-      }
-      
-      digitalWrite(statusLED, LOW);
-      processEncryptedPacket(ciphertext, LoRa.packetRssi());
-      digitalWrite(statusLED, HIGH);
-    } else {
-      while (LoRa.available()) LoRa.read();
+  if (packetSize == 16) {
+    uint8_t ciphertext[16];
+    for (int i = 0; i < 16; i++) {
+      ciphertext[i] = LoRa.read();
     }
+    digitalWrite(statusLED, LOW);
+    processEncryptedPacket(ciphertext, LoRa.packetRssi());
+    digitalWrite(statusLED, HIGH);
+  } else if (packetSize) {
+    while (LoRa.available()) LoRa.read();
   }
 }
