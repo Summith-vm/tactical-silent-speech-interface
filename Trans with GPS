@@ -10,12 +10,14 @@
 const int bioAmpPin   = D0;          
 const int csPin       = D3;          
 const int resetPin    = D1;          
-const int irqPin      = -1;          
+const int irqPin      = -1; // -1 explicitly frees D2 for your 2nd BioAmp later      
 const int statusLED   = LED_BUILTIN; 
 
 // --- I2C PINS (MPU6050 & LCD SHARED BUS) ---
-const int sdaPin      = D2;
-const int sclPin      = D6;
+const int sdaPin      = D4;
+const int sclPin      = D5;
+
+// --- MPU6050 CONFIGURATION ---
 const int MPU_ADDR    = 0x68; 
 int16_t AcX, AcY, AcZ, Tmp, GyX, GyY, GyZ;
 
@@ -24,7 +26,7 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // --- GPS CONFIGURATION (GY-NEO6MV2) ---
 TinyGPSPlus gps;
-HardwareSerial gpsSerial(1); // UART1: D7 = RX, D6 is SCL
+HardwareSerial gpsSerial(1); // UART1: D7 = RX, D6 = TX
 
 // --- RF & HARDWARE ENCRYPTION CONFIGURATION ---
 const long BANDWIDTH_FREQ = 433E6;   
@@ -67,27 +69,28 @@ int jawTapCount = 0;
 unsigned long lastJawTime = 0;
 bool waitingJaw = false;
 
+// --- NON-BLOCKING GPS BACKGROUND PARSER ---
 void feedGPS() {
   while (gpsSerial.available() > 0) {
     gps.encode(gpsSerial.read());
   }
 }
 
+// --- MPU6050 SETUP & READ FUNCTIONS ---
 void setupMPU() {
-  Wire.begin(sdaPin, sclPin);
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B); 
-  Wire.write(0);    
+  Wire.write(0x6B); // PWR_MGMT_1 register
+  Wire.write(0);    // Wake up MPU-6050
   if(Wire.endTransmission(true) == 0) {
-    Serial.println(">>> MPU6050 IMU DETECTED & INITIALIZED ON D2/D6 <<<");
+    Serial.println(">>> MPU6050 IMU DETECTED & INITIALIZED ON D4/D5 <<<");
   } else {
-    Serial.println("!!! WARNING: MPU6050 NOT DETECTED ON D2/D6 I2C BUS !!!");
+    Serial.println("!!! WARNING: MPU6050 NOT DETECTED ON D4/D5 I2C BUS !!!");
   }
 }
 
 void readMPU() {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3B); 
+  Wire.write(0x3B); // Starting with register 0x3B (ACCEL_XOUT_H)
   Wire.endTransmission(false);
   Wire.requestFrom(MPU_ADDR, 14, true); 
   
@@ -102,18 +105,22 @@ void readMPU() {
   }
 }
 
+// --- SECURE TRANSMISSION WITH AES-256, GPS, RTT ACK & DYNAMIC METRICS ---
 void sendEncryptedIntent(uint8_t commandID) {
   uint8_t plaintext[16] = {0};
   uint8_t ciphertext[16] = {0};
 
+  // 1. Pack Command Byte
   plaintext[0] = commandID; 
   
+  // 2. Pack 32-bit Anti-Replay Counter
   packetCounter++;
   plaintext[1] = (packetCounter >> 24) & 0xFF;
   plaintext[2] = (packetCounter >> 16) & 0xFF;
   plaintext[3] = (packetCounter >> 8)  & 0xFF;
   plaintext[4] = packetCounter & 0xFF;
 
+  // 3. Pack GPS Coordinates
   int32_t latFixed = 0;
   int32_t lngFixed = 0;
   uint8_t sats = (uint8_t)gps.satellites.value();
@@ -134,9 +141,12 @@ void sendEncryptedIntent(uint8_t commandID) {
   plaintext[12] = lngFixed & 0xFF;
 
   plaintext[13] = sats;
+  
+  // 4. Random Noise Padding
   plaintext[14] = esp_random() & 0xFF;
   plaintext[15] = esp_random() & 0xFF;
 
+  // 5. Hardware AES-256 Encryption
   mbedtls_aes_context aes;
   mbedtls_aes_init(&aes);
   mbedtls_aes_setkey_enc(&aes, aes_key, 256); 
@@ -145,8 +155,10 @@ void sendEncryptedIntent(uint8_t commandID) {
 
   digitalWrite(statusLED, LOW); 
 
+  // Start RTT Latency Timer
   unsigned long txStartTime = millis(); 
 
+  // 6. Transmit 16-Byte Ciphertext via LoRa
   LoRa.beginPacket();
   LoRa.write(ciphertext, 16);
   LoRa.endPacket();
@@ -159,7 +171,9 @@ void sendEncryptedIntent(uint8_t commandID) {
   }
   Serial.println();
 
+  // EXPERT FIX: delay(2) after clear to prevent RAM corruption
   lcd.clear();
+  delay(2);
   lcd.setCursor(0, 0);
   lcd.print("Sent Cmd ");
   lcd.print(commandID);
@@ -169,7 +183,8 @@ void sendEncryptedIntent(uint8_t commandID) {
   Serial.println("[WAITING FOR ACK] Listening for Receiver confirmation...");
   bool gotAck = false;
 
-  while (millis() - txStartTime < 1500) {
+  // 7. Listen for Receiver Echo (INCREASED WINDOW TO 4 SECONDS / 4000ms)
+  while (millis() - txStartTime < 4000) {
     int packetSize = LoRa.parsePacket();
     if (packetSize == 16) {
       uint8_t ackCiphertext[16];
@@ -193,47 +208,76 @@ void sendEncryptedIntent(uint8_t commandID) {
         if (ackCounter == packetCounter) {
           unsigned long rtt = millis() - txStartTime;
           uint8_t echoedCommand = ackPlaintext[5];
-          unsigned long oneWayLatency = (rtt - 50) / 2;
+          
+          // Calculate One-Way Latency (subtracting 50ms receiver processing time)
+          unsigned long oneWayLatency = (rtt > 50) ? (rtt - 50) / 2 : rtt / 2;
+          
+          // Calculate Data Rate (Throughput)
+          // Payload is 16 bytes = 128 bits. Data Rate = Bits / Seconds
+          float oneWaySec = oneWayLatency / 1000.0;
+          int dataRateBps = 0;
+          if (oneWaySec > 0) {
+            dataRateBps = (int)(128.0 / oneWaySec); 
+          }
 
           Serial.println("\n>>>>>>>>>> [SUCCESS] VALID ACK RECEIVED! <<<<<<<<<<");
           Serial.printf("Transmitted Command : %u\n", commandID);
           Serial.printf("Receiver Echoed     : %u (PERFECT MATCH!)\n", echoedCommand);
           Serial.printf("Round Trip Time     : %lu ms\n", rtt);
           Serial.printf("One-Way Latency     : ~%lu ms\n", oneWayLatency);
+          Serial.printf("Effective Data Rate : %d bps\n", dataRateBps);
           Serial.println(">>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<\n");
 
-          // DISPLAY LATENCY METRICS ON LCD
+          // LCD SCREEN 1: Display Latency Metrics
           lcd.clear();
+          delay(2);
           lcd.setCursor(0, 0);
           lcd.print("RTT: ");
           lcd.print(rtt);
           lcd.print("ms");
-
           lcd.setCursor(0, 1);
           lcd.print("1-Way: ");
           lcd.print(oneWayLatency);
           lcd.print("ms");
 
           gotAck = true;
-          delay(1500); // HELD STRICTLY FOR 1.5 SECONDS
+          delay(2500); // Hold Screen 1 for 2.5 Seconds
+
+          // LCD SCREEN 2: Display Data Rate Metrics
+          lcd.clear();
+          delay(2);
+          lcd.setCursor(0, 0);
+          lcd.print("TX Rate: ");
+          lcd.print(dataRateBps);
+          lcd.print("bps");
+          lcd.setCursor(0, 1);
+          lcd.print("RX Rate: ");
+          lcd.print(dataRateBps);
+          lcd.print("bps");
+          
+          delay(2500); // Hold Screen 2 for 2.5 Seconds
           break; 
         }
       }
     }
-    delay(1);
+    delay(1); // Small hardware breath
   }
 
+  // Handle packet loss display
   if (!gotAck) {
     Serial.println("!!!!!!!!!! [WARNING] ACK TIMEOUT (Packet may be lost) !!!!!!!!!!");
     lcd.clear();
+    delay(2);
     lcd.setCursor(0, 0);
     lcd.print("ACK TIMEOUT!");
     lcd.setCursor(0, 1);
     lcd.print("Packet Lost");
-    delay(1500);
+    delay(2500); 
   }
 
+  // Restore Default LCD State
   lcd.clear();
+  delay(2);
   lcd.setCursor(0, 0);
   lcd.print("TX ARMED & READY");
   lcd.setCursor(0, 1);
@@ -248,16 +292,29 @@ void setup() {
   
   analogReadResolution(12);
 
+  // 1. Initialize Shared I2C Bus (D4/D5)
   Wire.begin(sdaPin, sclPin);
+  
+  // EXPERT FIX: Force I2C clock to exactly 100kHz
+  Wire.setClock(100000);
+  
+  // 2. Initialize LCD
   lcd.init();
+  delay(10); 
   lcd.backlight();
+  lcd.clear();
+  delay(2);
   lcd.setCursor(0, 0);
   lcd.print("TX BOOTING...");
   delay(500);
 
-  gpsSerial.begin(9600, SERIAL_8N1, D7, -1);
+  // 3. Initialize GPS UART (D7 = RX, D6 = TX)
+  gpsSerial.begin(9600, SERIAL_8N1, D7, D6);
+
+  // 4. Initialize MPU6050 IMU
   setupMPU();
 
+  // 5. Hardware Reset LoRa
   pinMode(resetPin, OUTPUT);
   digitalWrite(resetPin, LOW);
   delay(100);
@@ -269,28 +326,33 @@ void setup() {
   if (!LoRa.begin(BANDWIDTH_FREQ)) {
     Serial.println("FATAL: LoRa Init Failed! Check SPI Connections.");
     lcd.clear();
+    delay(2);
     lcd.print("LORA SPI FAILED!");
     while (1);
   }
 
+  // LoRa Configuration
   LoRa.setTxPower(20, PA_OUTPUT_PA_BOOST_PIN); 
   LoRa.setSyncWord(SYNC_WORD);                  
   LoRa.setSpreadingFactor(10);           
   LoRa.setSignalBandwidth(125E3);        
   LoRa.setCodingRate4(5);               
 
+  // 6. BioAmp Baseline Calibration
   long initSum = 0;
   for (int i = 0; i < 80; i++) {
     int val = analogRead(bioAmpPin);
     initSum += abs(val - 2048);
     delay(2);
-    feedGPS();
+    feedGPS(); // Feed GPS during calibration to avoid buffer overflow
   }
   filteredEnergy = (initSum / 80.0f / 10.0f) * 15.0f;
 
-  Serial.println(">>> TRANSMITTER READY: D2/D6 I2C FUSION + GPS + ACK LCD ARMED <<<");
+  Serial.println(">>> TRANSMITTER READY: D4/D5 I2C FUSION + GPS + ADVANCED ACK LCD ARMED <<<");
 
+  // Final Setup LCD State
   lcd.clear();
+  delay(2);
   lcd.setCursor(0, 0);
   lcd.print("TX ARMED & READY");
   lcd.setCursor(0, 1);
@@ -298,14 +360,19 @@ void setup() {
 }
 
 void loop() {
+  // Feed GPS continuously
   feedGPS();
+
+  // 1. Read IMU for Sensor Fusion
   readMPU();
 
+  // Check if head is moving drastically
   bool motionArtifactActive = false;
   if (abs(GyX) > 15000 || abs(GyY) > 15000 || abs(GyZ) > 15000) {
     motionArtifactActive = true;
   }
 
+  // 2. Burst Sampling BioAmp
   long burstSum = 0;
   int rawCenter = 2048; 
 
@@ -313,7 +380,7 @@ void loop() {
     int val = analogRead(bioAmpPin);
     burstSum += abs(val - rawCenter); 
     delayMicroseconds(300);
-    if (i == 30) feedGPS();
+    if (i == 30) feedGPS(); 
   }
 
   float currentEnergy = (burstSum / 10.0f) * 15.0f; 
@@ -321,11 +388,13 @@ void loop() {
   float netSignal = currentEnergy - filteredEnergy;
   float tacticalSignal = (netSignal < NOISE_DEADZONE) ? 0.0f : (netSignal - NOISE_DEADZONE);
 
+  // 3. Apply Sensor Fusion (Artifact Rejection)
   if (motionArtifactActive) {
     tacticalSignal = 0.0f;
     Serial.println("[ARTIFACT CANCELED] Bio-Spike rejected due to Head Movement!");
   }
 
+  // Print plotter data
   Serial.print("Baseline:");
   Serial.print(filteredEnergy);
   Serial.print(",");
@@ -337,6 +406,7 @@ void loop() {
 
   unsigned long now = millis();
 
+  // --- 1. RISING EDGE DETECT ---
   if (!isActuated && tacticalSignal > TRIGGER_LIMIT) {
     isActuated = true;
     actuationStartTime = now;
@@ -344,6 +414,7 @@ void loop() {
     isJawPeak = false;
   }
 
+  // --- 2. ACTIVE HOLD & LONG CLENCH DETECT ---
   if (isActuated) {
     if (tacticalSignal >= JAW_TRIGGER_LIMIT) {
       isJawPeak = true;
@@ -367,6 +438,7 @@ void loop() {
     }
   }
 
+  // --- 3. FALLING EDGE DETECT ---
   float releaseThreshold = TRIGGER_LIMIT * 0.35f;
   if (isActuated && tacticalSignal < releaseThreshold) {
     isActuated = false;
@@ -403,6 +475,7 @@ void loop() {
     }
   }
 
+  // --- 4. TIMEOUT / SINGLE ACTION RESOLUTION ---
   if (waitingSwallow && (now - lastSwallowTime > DOUBLE_TAP_WINDOW)) {
     if (swallowTapCount == 1 && !isActuated) {
       Serial.println("\n***************************");
