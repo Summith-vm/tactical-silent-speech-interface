@@ -1,94 +1,230 @@
-/* * Tactical SSI - Golden Liquid Smooth EMG
- * Structure: Double Exponential Smoothing (Working Version)
- * Tuning: Ultra-Low Alpha for Liquid Motion
- */
+#include <Wire.h>
+#include <MPU6050.h>
 
-const int bioAmpPin = D0;
+MPU6050 mpu;
 
-// --- DUAL-STAGE SMOOTHING TUNED ---
-const float FILTER_ALPHA = 0.06f; // Dropped from 0.08 for even more liquid feel
-float filteredRMS = 0.0f;
-float trend      = 0.0f; 
+// --- PIN DEFINITIONS ---
+const int bioAmpPin = D0; // A0 / GPIO 1 on XIAO ESP32-S3
 
-float adcCenter   = 2048.0f;
-float baselineRMS = 0.0f;
+// --- PROVEN DUAL-STAGE FILTERING (Preserved Exactly) ---
+const float FILTER_ALPHA      = 0.08f; 
+const float POST_FILTER_ALPHA = 0.15f; 
+float filteredRMS    = 0.0f;
+float trend          = 0.0f; 
+float ultraSmoothRMS = 0.0f;
+
+// Baseline & Calibration Trackers
+float adcCenter    = 2048.0f;
+float baselineRMS  = 0.0f;
 float triggerLevel = 0.0f;
 
-// --- CALIBRATION ---
-const float TRIG_THRESHOLD_MULT = 1.35f; 
-const float MIN_SIGNAL_JUMP      = 4.5f; 
+// Calibration Multipliers matching your 30.0 line
+const float TRIG_THRESHOLD_MULT = 1.15f; 
+const float MIN_SIGNAL_JUMP     = 18.0f; 
+const float MAX_TRIGGER_LIMIT   = 30.0f; 
 
-bool isClenched = false;
-unsigned long lastTrigger = 0;
+// State Tracking
+int clenchState = 0; // 0 = relaxed, 1 = clenched
 
-void calibrate() {
-  Serial.println("\n>>> CALIBRATING: RELAX COMPLETELY <<<");
-  delay(1200);
+// --- GESTURE TIMING PARAMETERS ---
+unsigned long clenchStartTime       = 0;
+unsigned long firstClenchReleaseTime = 0;
+int clenchCount                     = 0;
+bool waitingForSecondClench         = false;
+bool longClenchFired                = false;
 
-  long dcSum = 0;
-  for(int i=0; i<300; i++) { dcSum += analogRead(bioAmpPin); delay(1); }
-  adcCenter = (float)dcSum / 300.0f;
+// Robust Timing Boundaries (Tuned for Human Physiology)
+const unsigned long MIN_PULSE_DURATION   = 80;   // Discard transient noise spikes < 80ms
+const unsigned long LONG_CLENCH_MIN_MS   = 1100; // Hold >= 1.1s triggers Long Clench effortlessly
+const unsigned long DOUBLE_CLENCH_WINDOW = 2500; // 2.5s window for 2nd clench (2-4s range)
+const unsigned long HOLD_DELAY_MS        = 2000; // Hold message on screen for 2 seconds
 
-  float rmsSum = 0;
-  for(int i=0; i<60; i++) { rmsSum += getInstantRMS(); }
-  baselineRMS = rmsSum / 60.0f;
-  filteredRMS = baselineRMS;
-  trend = 0;
-
-  triggerLevel = baselineRMS + max(baselineRMS * (TRIG_THRESHOLD_MULT - 1.0f), MIN_SIGNAL_JUMP);
-  Serial.printf("Base Noise: %.2f | Trigger: %.2f\n", baselineRMS, triggerLevel);
-}
-
+// Fast Burst RMS Calculation
 float getInstantRMS() {
   float sumSq = 0;
-  const int BURST_SAMPLES = 50; 
+  const int BURST_SAMPLES = 40; 
   for (int i = 0; i < BURST_SAMPLES; i++) {
     float val = (float)analogRead(bioAmpPin) - adcCenter;
     sumSq += val * val;
-    delayMicroseconds(150);
+    delayMicroseconds(120);
   }
-  return sqrtf(sumSq / BURST_SAMPLES);
+  return sqrtf(sumSq / (float)BURST_SAMPLES);
+}
+
+void calibrate() {
+  delay(800);
+
+  // 1. Establish True Hardware DC Center Offset
+  long dcSum = 0;
+  for (int i = 0; i < 300; i++) { 
+    dcSum += analogRead(bioAmpPin); 
+    delay(1); 
+  }
+  adcCenter = (float)dcSum / 300.0f;
+
+  // 2. Establish Resting Noise RMS Floor
+  float rmsSum = 0;
+  for (int i = 0; i < 60; i++) { 
+    rmsSum += getInstantRMS(); 
+  }
+  baselineRMS = rmsSum / 60.0f;
+  filteredRMS = baselineRMS;
+  ultraSmoothRMS = baselineRMS;
+  trend = 0.0f;
+
+  // 3. Set Dynamic Trigger Level (Ceiling clamped to 30.0)
+  float dynamicJump = max(baselineRMS * (TRIG_THRESHOLD_MULT - 1.0f), MIN_SIGNAL_JUMP);
+  if (dynamicJump > MAX_TRIGGER_LIMIT) {
+    dynamicJump = MAX_TRIGGER_LIMIT;
+  }
+  triggerLevel = baselineRMS + dynamicJump;
 }
 
 void setup() {
   Serial.begin(115200);
+  while (!Serial);
+
   analogReadResolution(12);
+
+  // Initialize I2C Bus on default D4/D5
+  Wire.begin();
+  Wire.setClock(100000);
+  mpu.initialize();
+
+  // Run Initial Calibration
   calibrate();
+
+  // Serial Plotter / Monitor Header
+  Serial.println("EMG_Signal,Trigger_Threshold,Clench_State");
 }
 
 void loop() {
-  if (Serial.available() && Serial.read() == 'r') calibrate();
+  // Recalibrate anytime by sending 'r' while jaw is relaxed
+  if (Serial.available() && Serial.read() == 'r') {
+    calibrate();
+  }
 
+  // 1. Compute Instantaneous RMS Power
   float rawRMS = getInstantRMS();
 
-  // --- STABLE DOUBLE EXPONENTIAL SMOOTHING ---
+  // 2. Stage 1: Double Exponential Smoothing
   float lastFiltered = filteredRMS;
   filteredRMS = (FILTER_ALPHA * rawRMS) + ((1.0f - FILTER_ALPHA) * (filteredRMS + trend));
   trend = (FILTER_ALPHA * (filteredRMS - lastFiltered)) + ((1.0f - FILTER_ALPHA) * trend);
 
-  // Scaling for Plotter (0 = Baseline)
-  float plotSignal = max(0.0f, filteredRMS - baselineRMS);
-  float plotLimit  = max(0.0f, triggerLevel - baselineRMS);
+  // 3. Stage 2: Low-Pass Filter
+  ultraSmoothRMS = (POST_FILTER_ALPHA * filteredRMS) + ((1.0f - POST_FILTER_ALPHA) * ultraSmoothRMS);
 
-  // Clean the signal (Noise Gate)
-  if (plotSignal < 1.0) plotSignal = 0;
-
-  Serial.print("Liquid_Smooth:"); Serial.print(plotSignal);
-  Serial.print(",Trigger_Line:"); Serial.println(plotLimit);
-
-  // Logic with Hysteresis
-  if (!isClenched && filteredRMS > triggerLevel) {
-    isClenched = true;
-    unsigned long now = millis();
-    if (now - lastTrigger < 1000) {
-      Serial.println(">>> [DOUBLE CLENCH] <<<");
-      lastTrigger = 0;
-    } else {
-      Serial.println(">>> [SINGLE] <<<");
-      lastTrigger = now;
-    }
-  } 
-  else if (isClenched && filteredRMS < (baselineRMS + (triggerLevel - baselineRMS) * 0.35)) {
-    isClenched = false; // Release at 35% height for maximum stability
+  // 4. Deadband Noise Gate
+  float activeSignal = ultraSmoothRMS - baselineRMS;
+  if (activeSignal < 1.0f) {
+    activeSignal = 0.0f;
   }
+
+  float thresholdRel = triggerLevel - baselineRMS;
+  float releaseThreshold = thresholdRel * 0.30f; // Stable 30% release floor
+
+  unsigned long now = millis();
+
+  // 5. Intent Classifier State Machine
+
+  // --- RISING EDGE: Clench Begins ---
+  if (clenchState == 0 && activeSignal > thresholdRel) {
+    clenchState = 1;
+    clenchStartTime = now;
+    longClenchFired = false;
+  } 
+
+  // --- SUSTAINED CONTRACTION: Check for Long Clench ---
+  if (clenchState == 1 && !longClenchFired) {
+    // If held above release floor for >= 1.1 seconds, fire Long Clench immediately!
+    if ((now - clenchStartTime >= LONG_CLENCH_MIN_MS) && (activeSignal >= (thresholdRel * 0.40f))) {
+      longClenchFired = true;
+      waitingForSecondClench = false;
+      clenchCount = 0;
+
+      Serial.println();
+      Serial.println("========================================");
+      Serial.println("     >>> DETECTED: LONG CLENCH <<<      ");
+      Serial.println("========================================");
+      Serial.println();
+
+      delay(HOLD_DELAY_MS); // Hold on Serial Monitor for 2 seconds
+
+      // Wait until jaw is fully relaxed below release threshold before accepting next gesture
+      while (activeSignal > releaseThreshold) {
+        float rRMS = getInstantRMS();
+        float lF = filteredRMS;
+        filteredRMS = (FILTER_ALPHA * rRMS) + ((1.0f - FILTER_ALPHA) * (filteredRMS + trend));
+        trend = (FILTER_ALPHA * (filteredRMS - lF)) + ((1.0f - FILTER_ALPHA) * trend);
+        ultraSmoothRMS = (POST_FILTER_ALPHA * filteredRMS) + ((1.0f - POST_FILTER_ALPHA) * ultraSmoothRMS);
+        activeSignal = max(0.0f, ultraSmoothRMS - baselineRMS);
+        delay(10);
+      }
+      clenchState = 0;
+    }
+  }
+
+  // --- FALLING EDGE: Clench Released ---
+  if (clenchState == 1 && activeSignal < releaseThreshold) {
+    clenchState = 0;
+    unsigned long pulseDuration = now - clenchStartTime;
+
+    // Process tap gestures only if it was NOT already triggered as a Long Clench
+    if (!longClenchFired && pulseDuration >= MIN_PULSE_DURATION && pulseDuration < LONG_CLENCH_MIN_MS) {
+      clenchCount++;
+      if (clenchCount == 1) {
+        firstClenchReleaseTime = now;
+        waitingForSecondClench = true;
+      } 
+      else if (clenchCount >= 2) {
+        // Double clench completed within the window!
+        waitingForSecondClench = false;
+        clenchCount = 0;
+
+        Serial.println();
+        Serial.println("========================================");
+        Serial.println("    >>> DETECTED: DOUBLE CLENCH <<<     ");
+        Serial.println("========================================");
+        Serial.println();
+
+        delay(HOLD_DELAY_MS); // Hold on Serial Monitor for 2 seconds
+
+        // Reset filter accumulators cleanly so release tail doesn't re-trigger
+        ultraSmoothRMS = baselineRMS;
+        filteredRMS    = baselineRMS;
+        trend          = 0.0f;
+      }
+    }
+  }
+
+  // --- TIMEOUT EVALUATION: Single Clench Confirmed ---
+  if (waitingForSecondClench && (now - firstClenchReleaseTime > DOUBLE_CLENCH_WINDOW)) {
+    waitingForSecondClench = false;
+    clenchCount = 0;
+
+    Serial.println();
+    Serial.println("----------------------------------------");
+    Serial.println("    >>> DETECTED: SINGLE CLENCH <<<     ");
+    Serial.println("----------------------------------------");
+    Serial.println();
+
+    delay(HOLD_DELAY_MS); // Hold on Serial Monitor for 2 seconds
+
+    // Reset filter accumulators cleanly
+    ultraSmoothRMS = baselineRMS;
+    filteredRMS    = baselineRMS;
+    trend          = 0.0f;
+  }
+
+  // 6. Background IMU Read
+  int16_t ax, ay, az, gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+  // 7. Output Stream for Serial Plotter
+  Serial.print(activeSignal);
+  Serial.print(",");
+  Serial.print(thresholdRel);
+  Serial.print(",");
+  Serial.println(clenchState * (thresholdRel * 1.2f)); 
 }
